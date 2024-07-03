@@ -62,14 +62,13 @@ BuildRequires:	rpmbuild(macros) >= 1.752
 BuildRequires:	sed >= 4.0
 BuildRequires:	zlib-devel >= 1.2.3
 %if %{with tests} && 0%(id -u sshd >/dev/null 2>&1; echo $?)
-BuildRequires:	%{name}-server
+BuildRequires:	openssh-server
 %endif
 %if %{with tests} && %{with libseccomp}
 # libseccomp based sandbox requires NO_NEW_PRIVS prctl flag
 BuildRequires:	uname(release) >= 3.5
 %endif
 Requires:	zlib >= 1.2.3
-Obsoletes:	ssh
 BuildRoot:	%{tmpdir}/%{name}-%{version}-root-%(id -u -n)
 
 %define		_sysconfdir	/etc/ssh
@@ -202,8 +201,6 @@ Summary(pt_BR.UTF-8):	Clientes do OpenSSH
 Summary(ru.UTF-8):	OpenSSH - клиенты протокола Secure Shell
 Summary(uk.UTF-8):	OpenSSH - клієнти протоколу Secure Shell
 Group:		Applications/Networking
-Requires:	%{name} = %{epoch}:%{version}-%{release}
-Suggests:	%{name}-clients-helper-fido = %{epoch}:%{version}-%{release}
 %requires_eq_to	openssl%{?_isa}	openssl-devel
 
 %description clients
