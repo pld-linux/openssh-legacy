@@ -22,7 +22,7 @@ Summary(uk.UTF-8):	OpenSSH - вільна реалізація протокол�
 Name:		openssh-legacy
 # Upgrade only to versions that support DSA keys
 Version:	9.8p1
-Release:	6
+Release:	7
 License:	BSD
 Group:		Applications/Networking
 Source0:	https://ftp.openbsd.org/pub/OpenBSD/OpenSSH/portable/openssh-%{version}.tar.gz
