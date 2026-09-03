@@ -1,0 +1,1153 @@
+Restore DSA (ssh-dss) support, removed upstream in 10.0.
+
+Reverse of upstream a32d28d79256 plus the --enable-dsa-keys configure knob,
+which upstream dropped in a separate commit.  Everything stays behind
+WITH_DSA, so a build without --enable-dsa-keys is unaffected.
+
+Rebasing this against a new release: reverse-apply
+https://github.com/openssh/openssh-portable/commit/a32d28d79256.patch and
+re-add the configure.ac hunks below; the rest is context drift.
+
+--- openssh-10.5p1.orig/ssh-dss.c	2026-09-03 17:59:28.199664554 +0200
++++ openssh-10.5p1/ssh-dss.c	2026-09-03 17:25:34.368593374 +0200
+@@ -0,0 +1,457 @@
++/* $OpenBSD: ssh-dss.c,v 1.50 2024/01/11 01:45:36 djm Exp $ */
++/*
++ * Copyright (c) 2000 Markus Friedl.  All rights reserved.
++ *
++ * Redistribution and use in source and binary forms, with or without
++ * modification, are permitted provided that the following conditions
++ * are met:
++ * 1. Redistributions of source code must retain the above copyright
++ *    notice, this list of conditions and the following disclaimer.
++ * 2. Redistributions in binary form must reproduce the above copyright
++ *    notice, this list of conditions and the following disclaimer in the
++ *    documentation and/or other materials provided with the distribution.
++ *
++ * THIS SOFTWARE IS PROVIDED BY THE AUTHOR ``AS IS'' AND ANY EXPRESS OR
++ * IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
++ * OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.
++ * IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY DIRECT, INDIRECT,
++ * INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT
++ * NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
++ * DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
++ * THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
++ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
++ * THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
++ */
++
++#include "includes.h"
++
++#if defined(WITH_OPENSSL) && defined(WITH_DSA)
++
++#include <sys/types.h>
++
++#include <openssl/bn.h>
++#include <openssl/dsa.h>
++#include <openssl/evp.h>
++
++#include <stdarg.h>
++#include <string.h>
++
++#include "sshbuf.h"
++#include "ssherr.h"
++#include "digest.h"
++#define SSHKEY_INTERNAL
++#include "sshkey.h"
++
++#include "openbsd-compat/openssl-compat.h"
++
++#define INTBLOB_LEN	20
++#define SIGBLOB_LEN	(2*INTBLOB_LEN)
++
++static u_int
++ssh_dss_size(const struct sshkey *key)
++{
++	const BIGNUM *dsa_p;
++
++	if (key->dsa == NULL)
++		return 0;
++	DSA_get0_pqg(key->dsa, &dsa_p, NULL, NULL);
++	return BN_num_bits(dsa_p);
++}
++
++static int
++ssh_dss_alloc(struct sshkey *k)
++{
++	if ((k->dsa = DSA_new()) == NULL)
++		return SSH_ERR_ALLOC_FAIL;
++	return 0;
++}
++
++static void
++ssh_dss_cleanup(struct sshkey *k)
++{
++	DSA_free(k->dsa);
++	k->dsa = NULL;
++}
++
++static int
++ssh_dss_equal(const struct sshkey *a, const struct sshkey *b)
++{
++	const BIGNUM *dsa_p_a, *dsa_q_a, *dsa_g_a, *dsa_pub_key_a;
++	const BIGNUM *dsa_p_b, *dsa_q_b, *dsa_g_b, *dsa_pub_key_b;
++
++	if (a->dsa == NULL || b->dsa == NULL)
++		return 0;
++	DSA_get0_pqg(a->dsa, &dsa_p_a, &dsa_q_a, &dsa_g_a);
++	DSA_get0_pqg(b->dsa, &dsa_p_b, &dsa_q_b, &dsa_g_b);
++	DSA_get0_key(a->dsa, &dsa_pub_key_a, NULL);
++	DSA_get0_key(b->dsa, &dsa_pub_key_b, NULL);
++	if (dsa_p_a == NULL || dsa_p_b == NULL ||
++	    dsa_q_a == NULL || dsa_q_b == NULL ||
++	    dsa_g_a == NULL || dsa_g_b == NULL ||
++	    dsa_pub_key_a == NULL || dsa_pub_key_b == NULL)
++		return 0;
++	if (BN_cmp(dsa_p_a, dsa_p_b) != 0)
++		return 0;
++	if (BN_cmp(dsa_q_a, dsa_q_b) != 0)
++		return 0;
++	if (BN_cmp(dsa_g_a, dsa_g_b) != 0)
++		return 0;
++	if (BN_cmp(dsa_pub_key_a, dsa_pub_key_b) != 0)
++		return 0;
++	return 1;
++}
++
++static int
++ssh_dss_serialize_public(const struct sshkey *key, struct sshbuf *b,
++    enum sshkey_serialize_rep opts)
++{
++	int r;
++	const BIGNUM *dsa_p, *dsa_q, *dsa_g, *dsa_pub_key;
++
++	if (key->dsa == NULL)
++		return SSH_ERR_INVALID_ARGUMENT;
++	DSA_get0_pqg(key->dsa, &dsa_p, &dsa_q, &dsa_g);
++	DSA_get0_key(key->dsa, &dsa_pub_key, NULL);
++	if (dsa_p == NULL || dsa_q == NULL ||
++	    dsa_g == NULL || dsa_pub_key == NULL)
++		return SSH_ERR_INTERNAL_ERROR;
++	if ((r = sshbuf_put_bignum2(b, dsa_p)) != 0 ||
++	    (r = sshbuf_put_bignum2(b, dsa_q)) != 0 ||
++	    (r = sshbuf_put_bignum2(b, dsa_g)) != 0 ||
++	    (r = sshbuf_put_bignum2(b, dsa_pub_key)) != 0)
++		return r;
++
++	return 0;
++}
++
++static int
++ssh_dss_serialize_private(const struct sshkey *key, struct sshbuf *b,
++    enum sshkey_serialize_rep opts)
++{
++	int r;
++	const BIGNUM *dsa_priv_key;
++
++	DSA_get0_key(key->dsa, NULL, &dsa_priv_key);
++	if (!sshkey_is_cert(key)) {
++		if ((r = ssh_dss_serialize_public(key, b, opts)) != 0)
++			return r;
++	}
++	if ((r = sshbuf_put_bignum2(b, dsa_priv_key)) != 0)
++		return r;
++
++	return 0;
++}
++
++static int
++ssh_dss_generate(struct sshkey *k, int bits)
++{
++	DSA *private;
++
++	if (bits != 1024)
++		return SSH_ERR_KEY_LENGTH;
++	if ((private = DSA_new()) == NULL)
++		return SSH_ERR_ALLOC_FAIL;
++	if (!DSA_generate_parameters_ex(private, bits, NULL, 0, NULL,
++	    NULL, NULL) || !DSA_generate_key(private)) {
++		DSA_free(private);
++		return SSH_ERR_LIBCRYPTO_ERROR;
++	}
++	k->dsa = private;
++	return 0;
++}
++
++static int
++ssh_dss_copy_public(const struct sshkey *from, struct sshkey *to)
++{
++	const BIGNUM *dsa_p, *dsa_q, *dsa_g, *dsa_pub_key;
++	BIGNUM *dsa_p_dup = NULL, *dsa_q_dup = NULL, *dsa_g_dup = NULL;
++	BIGNUM *dsa_pub_key_dup = NULL;
++	int r = SSH_ERR_INTERNAL_ERROR;
++
++	DSA_get0_pqg(from->dsa, &dsa_p, &dsa_q, &dsa_g);
++	DSA_get0_key(from->dsa, &dsa_pub_key, NULL);
++	if ((dsa_p_dup = BN_dup(dsa_p)) == NULL ||
++	    (dsa_q_dup = BN_dup(dsa_q)) == NULL ||
++	    (dsa_g_dup = BN_dup(dsa_g)) == NULL ||
++	    (dsa_pub_key_dup = BN_dup(dsa_pub_key)) == NULL) {
++		r = SSH_ERR_ALLOC_FAIL;
++		goto out;
++	}
++	if (!DSA_set0_pqg(to->dsa, dsa_p_dup, dsa_q_dup, dsa_g_dup)) {
++		r = SSH_ERR_LIBCRYPTO_ERROR;
++		goto out;
++	}
++	dsa_p_dup = dsa_q_dup = dsa_g_dup = NULL; /* transferred */
++	if (!DSA_set0_key(to->dsa, dsa_pub_key_dup, NULL)) {
++		r = SSH_ERR_LIBCRYPTO_ERROR;
++		goto out;
++	}
++	dsa_pub_key_dup = NULL; /* transferred */
++	/* success */
++	r = 0;
++ out:
++	BN_clear_free(dsa_p_dup);
++	BN_clear_free(dsa_q_dup);
++	BN_clear_free(dsa_g_dup);
++	BN_clear_free(dsa_pub_key_dup);
++	return r;
++}
++
++static int
++ssh_dss_deserialize_public(const char *ktype, struct sshbuf *b,
++    struct sshkey *key)
++{
++	int ret = SSH_ERR_INTERNAL_ERROR;
++	BIGNUM *dsa_p = NULL, *dsa_q = NULL, *dsa_g = NULL, *dsa_pub_key = NULL;
++
++	if (sshbuf_get_bignum2(b, &dsa_p) != 0 ||
++	    sshbuf_get_bignum2(b, &dsa_q) != 0 ||
++	    sshbuf_get_bignum2(b, &dsa_g) != 0 ||
++	    sshbuf_get_bignum2(b, &dsa_pub_key) != 0) {
++		ret = SSH_ERR_INVALID_FORMAT;
++		goto out;
++	}
++	if (!DSA_set0_pqg(key->dsa, dsa_p, dsa_q, dsa_g)) {
++		ret = SSH_ERR_LIBCRYPTO_ERROR;
++		goto out;
++	}
++	dsa_p = dsa_q = dsa_g = NULL; /* transferred */
++	if (!DSA_set0_key(key->dsa, dsa_pub_key, NULL)) {
++		ret = SSH_ERR_LIBCRYPTO_ERROR;
++		goto out;
++	}
++	dsa_pub_key = NULL; /* transferred */
++#ifdef DEBUG_PK
++	DSA_print_fp(stderr, key->dsa, 8);
++#endif
++	/* success */
++	ret = 0;
++ out:
++	BN_clear_free(dsa_p);
++	BN_clear_free(dsa_q);
++	BN_clear_free(dsa_g);
++	BN_clear_free(dsa_pub_key);
++	return ret;
++}
++
++static int
++ssh_dss_deserialize_private(const char *ktype, struct sshbuf *b,
++    struct sshkey *key)
++{
++	int r;
++	BIGNUM *dsa_priv_key = NULL;
++
++	if (!sshkey_is_cert(key)) {
++		if ((r = ssh_dss_deserialize_public(ktype, b, key)) != 0)
++			return r;
++	}
++
++	if ((r = sshbuf_get_bignum2(b, &dsa_priv_key)) != 0)
++		return r;
++	if (!DSA_set0_key(key->dsa, NULL, dsa_priv_key)) {
++		BN_clear_free(dsa_priv_key);
++		return SSH_ERR_LIBCRYPTO_ERROR;
++	}
++	return 0;
++}
++
++static int
++ssh_dss_sign(struct sshkey *key,
++    u_char **sigp, size_t *lenp,
++    const u_char *data, size_t datalen,
++    const char *alg, const char *sk_provider, const char *sk_pin, u_int compat)
++{
++	DSA_SIG *sig = NULL;
++	const BIGNUM *sig_r, *sig_s;
++	u_char digest[SSH_DIGEST_MAX_LENGTH], sigblob[SIGBLOB_LEN];
++	size_t rlen, slen, len, dlen = ssh_digest_bytes(SSH_DIGEST_SHA1);
++	struct sshbuf *b = NULL;
++	int ret = SSH_ERR_INVALID_ARGUMENT;
++
++	if (lenp != NULL)
++		*lenp = 0;
++	if (sigp != NULL)
++		*sigp = NULL;
++
++	if (key == NULL || key->dsa == NULL ||
++	    sshkey_type_plain(key->type) != KEY_DSA)
++		return SSH_ERR_INVALID_ARGUMENT;
++	if (dlen == 0)
++		return SSH_ERR_INTERNAL_ERROR;
++
++	if ((ret = ssh_digest_memory(SSH_DIGEST_SHA1, data, datalen,
++	    digest, sizeof(digest))) != 0)
++		goto out;
++
++	if ((sig = DSA_do_sign(digest, dlen, key->dsa)) == NULL) {
++		ret = SSH_ERR_LIBCRYPTO_ERROR;
++		goto out;
++	}
++
++	DSA_SIG_get0(sig, &sig_r, &sig_s);
++	rlen = BN_num_bytes(sig_r);
++	slen = BN_num_bytes(sig_s);
++	if (rlen > INTBLOB_LEN || slen > INTBLOB_LEN) {
++		ret = SSH_ERR_INTERNAL_ERROR;
++		goto out;
++	}
++	explicit_bzero(sigblob, SIGBLOB_LEN);
++	BN_bn2bin(sig_r, sigblob + SIGBLOB_LEN - INTBLOB_LEN - rlen);
++	BN_bn2bin(sig_s, sigblob + SIGBLOB_LEN - slen);
++
++	if ((b = sshbuf_new()) == NULL) {
++		ret = SSH_ERR_ALLOC_FAIL;
++		goto out;
++	}
++	if ((ret = sshbuf_put_cstring(b, "ssh-dss")) != 0 ||
++	    (ret = sshbuf_put_string(b, sigblob, SIGBLOB_LEN)) != 0)
++		goto out;
++
++	len = sshbuf_len(b);
++	if (sigp != NULL) {
++		if ((*sigp = malloc(len)) == NULL) {
++			ret = SSH_ERR_ALLOC_FAIL;
++			goto out;
++		}
++		memcpy(*sigp, sshbuf_ptr(b), len);
++	}
++	if (lenp != NULL)
++		*lenp = len;
++	ret = 0;
++ out:
++	explicit_bzero(digest, sizeof(digest));
++	DSA_SIG_free(sig);
++	sshbuf_free(b);
++	return ret;
++}
++
++static int
++ssh_dss_verify(const struct sshkey *key,
++    const u_char *sig, size_t siglen,
++    const u_char *data, size_t dlen, const char *alg, u_int compat,
++    struct sshkey_sig_details **detailsp)
++{
++	DSA_SIG *dsig = NULL;
++	BIGNUM *sig_r = NULL, *sig_s = NULL;
++	u_char digest[SSH_DIGEST_MAX_LENGTH], *sigblob = NULL;
++	size_t len, hlen = ssh_digest_bytes(SSH_DIGEST_SHA1);
++	int ret = SSH_ERR_INTERNAL_ERROR;
++	struct sshbuf *b = NULL;
++	char *ktype = NULL;
++
++	if (key == NULL || key->dsa == NULL ||
++	    sshkey_type_plain(key->type) != KEY_DSA ||
++	    sig == NULL || siglen == 0)
++		return SSH_ERR_INVALID_ARGUMENT;
++	if (hlen == 0)
++		return SSH_ERR_INTERNAL_ERROR;
++
++	/* fetch signature */
++	if ((b = sshbuf_from(sig, siglen)) == NULL)
++		return SSH_ERR_ALLOC_FAIL;
++	if (sshbuf_get_cstring(b, &ktype, NULL) != 0 ||
++	    sshbuf_get_string(b, &sigblob, &len) != 0) {
++		ret = SSH_ERR_INVALID_FORMAT;
++		goto out;
++	}
++	if (strcmp("ssh-dss", ktype) != 0) {
++		ret = SSH_ERR_KEY_TYPE_MISMATCH;
++		goto out;
++	}
++	if (sshbuf_len(b) != 0) {
++		ret = SSH_ERR_UNEXPECTED_TRAILING_DATA;
++		goto out;
++	}
++
++	if (len != SIGBLOB_LEN) {
++		ret = SSH_ERR_INVALID_FORMAT;
++		goto out;
++	}
++
++	/* parse signature */
++	if ((dsig = DSA_SIG_new()) == NULL ||
++	    (sig_r = BN_new()) == NULL ||
++	    (sig_s = BN_new()) == NULL) {
++		ret = SSH_ERR_ALLOC_FAIL;
++		goto out;
++	}
++	if ((BN_bin2bn(sigblob, INTBLOB_LEN, sig_r) == NULL) ||
++	    (BN_bin2bn(sigblob + INTBLOB_LEN, INTBLOB_LEN, sig_s) == NULL)) {
++		ret = SSH_ERR_LIBCRYPTO_ERROR;
++		goto out;
++	}
++	if (!DSA_SIG_set0(dsig, sig_r, sig_s)) {
++		ret = SSH_ERR_LIBCRYPTO_ERROR;
++		goto out;
++	}
++	sig_r = sig_s = NULL; /* transferred */
++
++	/* sha1 the data */
++	if ((ret = ssh_digest_memory(SSH_DIGEST_SHA1, data, dlen,
++	    digest, sizeof(digest))) != 0)
++		goto out;
++
++	switch (DSA_do_verify(digest, hlen, dsig, key->dsa)) {
++	case 1:
++		ret = 0;
++		break;
++	case 0:
++		ret = SSH_ERR_SIGNATURE_INVALID;
++		goto out;
++	default:
++		ret = SSH_ERR_LIBCRYPTO_ERROR;
++		goto out;
++	}
++
++ out:
++	explicit_bzero(digest, sizeof(digest));
++	DSA_SIG_free(dsig);
++	BN_clear_free(sig_r);
++	BN_clear_free(sig_s);
++	sshbuf_free(b);
++	free(ktype);
++	if (sigblob != NULL)
++		freezero(sigblob, len);
++	return ret;
++}
++
++static const struct sshkey_impl_funcs sshkey_dss_funcs = {
++	/* .size = */		ssh_dss_size,
++	/* .alloc = */		ssh_dss_alloc,
++	/* .cleanup = */	ssh_dss_cleanup,
++	/* .equal = */		ssh_dss_equal,
++	/* .ssh_serialize_public = */ ssh_dss_serialize_public,
++	/* .ssh_deserialize_public = */ ssh_dss_deserialize_public,
++	/* .ssh_serialize_private = */ ssh_dss_serialize_private,
++	/* .ssh_deserialize_private = */ ssh_dss_deserialize_private,
++	/* .generate = */	ssh_dss_generate,
++	/* .copy_public = */	ssh_dss_copy_public,
++	/* .sign = */		ssh_dss_sign,
++	/* .verify = */		ssh_dss_verify,
++};
++
++const struct sshkey_impl sshkey_dss_impl = {
++	/* .name = */		"ssh-dss",
++	/* .shortname = */	"DSA",
++	/* .sigalg = */		NULL,
++	/* .type = */		KEY_DSA,
++	/* .nid = */		0,
++	/* .cert = */		0,
++	/* .sigonly = */	0,
++	/* .keybits = */	0,
++	/* .funcs = */		&sshkey_dss_funcs,
++};
++
++const struct sshkey_impl sshkey_dsa_cert_impl = {
++	/* .name = */		"ssh-dss-cert-v01@openssh.com",
++	/* .shortname = */	"DSA-CERT",
++	/* .sigalg = */		NULL,
++	/* .type = */		KEY_DSA_CERT,
++	/* .nid = */		0,
++	/* .cert = */		1,
++	/* .sigonly = */	0,
++	/* .keybits = */	0,
++	/* .funcs = */		&sshkey_dss_funcs,
++};
++
++#endif /* WITH_OPENSSL && WITH_DSA */
+--- openssh-10.5p1.orig/Makefile.in	2026-08-11 04:22:17.000000000 +0200
++++ openssh-10.5p1/Makefile.in	2026-09-03 17:52:29.113757934 +0200
+@@ -96,7 +96,7 @@ LIBSSH_OBJS=${LIBOPENSSH_OBJS} \
+ 	log.o match.o moduli.o nchan.o packet.o \
+ 	readpass.o ttymodes.o xmalloc.o addr.o addrmatch.o \
+ 	atomicio.o dispatch.o mac.o misc.o utf8.o \
+-	monitor_fdpass.o rijndael.o ssh-ecdsa.o ssh-ecdsa-sk.o \
++	monitor_fdpass.o rijndael.o ssh-dss.o ssh-ecdsa.o ssh-ecdsa-sk.o \
+ 	ssh-ed25519-sk.o ssh-rsa.o dh.o \
+ 	msg.o dns.o entropy.o gss-genr.o umac.o umac128.o \
+ 	smult_curve25519_ref.o \
+--- openssh-10.5p1.orig/PROTOCOL	2026-08-11 04:22:17.000000000 +0200
++++ openssh-10.5p1/PROTOCOL	2026-09-03 17:25:34.366074290 +0200
+@@ -691,15 +691,15 @@ authorized_keys files, are formatted as
+ of the public key algorithm name followed by a base64-encoded key blob.
+ The public key blob (before base64 encoding) is the same format used for
+ the encoding of public keys sent on the wire: as described in RFC4253
+-section 6.6 for RSA keys, RFC5656 section 3.1 for ECDSA keys and
+-https://datatracker.ietf.org/doc/draft-miller-ssh-cert/
+-for the OpenSSH certificate formats.
++section 6.6 for RSA and DSA keys, RFC5656 section 3.1 for ECDSA keys
++and the "New public key formats" section of PROTOCOL.certkeys for the
++OpenSSH certificate formats.
+ 
+ 5.2 Private key format
+ 
+ OpenSSH private keys, as generated by ssh-keygen(1) use the format
+ described in PROTOCOL.key by default. As a legacy option, PEM format
+-(RFC7468) private keys are also supported for RSA and ECDSA keys
++(RFC7468) private keys are also supported for RSA, DSA and ECDSA keys
+ and were the default format before OpenSSH 7.8.
+ 
+ 5.3 KRL format
+--- openssh-10.5p1.orig/TODO	2026-08-11 04:22:17.000000000 +0200
++++ openssh-10.5p1/TODO	2026-09-03 17:25:34.366210251 +0200
+@@ -7,7 +7,7 @@ Documentation:
+ 
+ - Install FAQ?
+ 
+-- General FAQ on S/Key, TIS, RSA, RSA2, etc and suggestions on when it
++- General FAQ on S/Key, TIS, RSA, RSA2, DSA, etc and suggestions on when it
+   would be best to use them.
+ 
+ - Create a Documentation/ directory?
+--- openssh-10.5p1.orig/authfd.c	2026-08-11 04:22:17.000000000 +0200
++++ openssh-10.5p1/authfd.c	2026-09-03 17:25:34.366316955 +0200
+@@ -601,6 +601,8 @@ ssh_add_identity_constrained(int sock, s
+ #ifdef WITH_OPENSSL
+ 	case KEY_RSA:
+ 	case KEY_RSA_CERT:
++	case KEY_DSA:
++	case KEY_DSA_CERT:
+ 	case KEY_ECDSA:
+ 	case KEY_ECDSA_CERT:
+ 	case KEY_ECDSA_SK:
+--- openssh-10.5p1.orig/authfile.c	2026-08-11 04:22:17.000000000 +0200
++++ openssh-10.5p1/authfile.c	2026-09-03 17:25:34.366462630 +0200
+@@ -324,6 +324,7 @@ sshkey_load_private_cert(int type, const
+ 	switch (type) {
+ #ifdef WITH_OPENSSL
+ 	case KEY_RSA:
++	case KEY_DSA:
+ 	case KEY_ECDSA:
+ #endif /* WITH_OPENSSL */
+ 	case KEY_ED25519:
+--- openssh-10.5p1.orig/configure.ac	2026-08-11 04:22:17.000000000 +0200
++++ openssh-10.5p1/configure.ac	2026-09-03 17:54:21.967977235 +0200
+@@ -2306,6 +2306,16 @@ AC_ARG_WITH([security-key-builtin],
+ 	[ enable_sk_internal=$withval ]
+ )
+ 
++enable_dsa=
++AC_ARG_ENABLE([dsa-keys],
++	[  --enable-dsa-keys       enable DSA key support [no]],
++	[
++		if test "x$enableval" != "xno" ; then
++			enable_dsa=1
++		fi
++	]
++)
++
+ enable_sk_standalone=
+ AC_ARG_WITH([security-key-standalone],
+ 	[  --with-security-key-standalone build standalone sk-libfido2 SecurityKeyProvider],
+@@ -3227,6 +3237,7 @@ if test "x$openssl" = "xyes" ; then
+ 	AC_CHECK_FUNCS([ \
+ 		BN_is_prime_ex \
+ 		DES_crypt \
++		DSA_generate_parameters_ex \
+ 		EVP_DigestSign \
+ 		EVP_DigestVerify \
+ 		EVP_DigestFinal_ex \
+@@ -3365,6 +3376,26 @@ if test "x$openssl" = "xyes" ; then
+ 		;;
+ 	esac
+ 
++
++	openssl_dsa=no
++	if test ! -z "$enable_dsa" ; then
++		AC_CHECK_DECLS([OPENSSL_NO_DSA], [], [
++			AC_CHECK_DECLS([OPENSSL_IS_BORINGSSL], [],
++			    [ openssl_dsa=yes ],
++			    [ #include <openssl/opensslconf.h> ]
++			)
++		    ],
++		    [ #include <openssl/opensslconf.h> ]
++		)
++		AC_MSG_CHECKING([whether to enable DSA key support])
++		if test "x$openssl_dsa" = "xno"; then
++			AC_MSG_ERROR([DSA requested but not supported by OpenSSL])
++		else
++			AC_MSG_RESULT([yes])
++			AC_DEFINE([WITH_DSA], [1],
++			   [DSA keys explicitly enabled])
++		fi
++	fi
+ fi
+ 
+ # PKCS11/U2F depend on OpenSSL and dlopen().
+--- openssh-10.5p1.orig/contrib/cygwin/ssh-user-config	2026-08-11 04:22:17.000000000 +0200
++++ openssh-10.5p1/contrib/cygwin/ssh-user-config	2026-09-03 17:25:34.367207621 +0200
+@@ -246,8 +246,9 @@ done
+ check_user_homedir
+ check_user_dot_ssh_dir
+ create_identity id_rsa rsa "SSH2 RSA"
+-create_identity id_ed25519 ed25519 "SSH2 Ed25519"
++create_identity id_dsa dsa "SSH2 DSA"
+ create_identity id_ecdsa ecdsa "SSH2 ECDSA"
++create_identity identity rsa1 "(deprecated) SSH1 RSA"
+ fix_authorized_keys_perms
+ 
+ echo
+--- openssh-10.5p1.orig/dns.c	2026-08-11 04:22:17.000000000 +0200
++++ openssh-10.5p1/dns.c	2026-09-03 17:25:34.367307221 +0200
+@@ -87,6 +87,9 @@ dns_read_key(uint8_t *algorithm, uint8_t
+ 	case KEY_RSA:
+ 		*algorithm = SSHFP_KEY_RSA;
+ 		break;
++	case KEY_DSA:
++		*algorithm = SSHFP_KEY_DSA;
++		break;
+ 	case KEY_ECDSA:
+ 		*algorithm = SSHFP_KEY_ECDSA;
+ 		break;
+--- openssh-10.5p1.orig/hostfile.c	2026-08-11 04:22:17.000000000 +0200
++++ openssh-10.5p1/hostfile.c	2026-09-03 17:25:34.367461153 +0200
+@@ -150,8 +150,8 @@ host_hash(const char *host, const char *
+ }
+ 
+ /*
+- * Parses an RSA key from a string. Moves the pointer over the key.
+- * Skips any whitespace at the beginning and at end.
++ * Parses an RSA (number of bits, e, n) or DSA key from a string.  Moves the
++ * pointer over the key.  Skips any whitespace at the beginning and at end.
+  */
+ 
+ int
+--- openssh-10.5p1.orig/openbsd-compat/openssl-compat.h	2026-08-11 04:22:17.000000000 +0200
++++ openssh-10.5p1/openbsd-compat/openssl-compat.h	2026-09-03 17:25:34.367591063 +0200
+@@ -43,6 +43,9 @@ int ssh_libcrypto_init(void);
+ #ifndef OPENSSL_RSA_MAX_MODULUS_BITS
+ # define OPENSSL_RSA_MAX_MODULUS_BITS	16384
+ #endif
++#ifndef OPENSSL_DSA_MAX_MODULUS_BITS
++# define OPENSSL_DSA_MAX_MODULUS_BITS	10000
++#endif
+ 
+ #ifdef LIBRESSL_VERSION_NUMBER
+ # if LIBRESSL_VERSION_NUMBER < 0x3010000fL
+--- openssh-10.5p1.orig/pathnames.h	2026-08-11 04:22:17.000000000 +0200
++++ openssh-10.5p1/pathnames.h	2026-09-03 17:52:29.113572140 +0200
+@@ -36,6 +36,7 @@
+  */
+ #define _PATH_SERVER_CONFIG_FILE	SSHDIR "/sshd_config"
+ #define _PATH_HOST_CONFIG_FILE		SSHDIR "/ssh_config"
++#define _PATH_HOST_DSA_KEY_FILE		SSHDIR "/ssh_host_dsa_key"
+ #define _PATH_HOST_ECDSA_KEY_FILE	SSHDIR "/ssh_host_ecdsa_key"
+ #define _PATH_HOST_RSA_KEY_FILE		SSHDIR "/ssh_host_rsa_key"
+ #define _PATH_HOST_ED25519_KEY_FILE	SSHDIR "/ssh_host_ed25519_key"
+@@ -86,6 +87,7 @@
+  * Name of the default file containing client-side authentication key. This
+  * file should only be readable by the user him/herself.
+  */
++#define _PATH_SSH_CLIENT_ID_DSA		_PATH_SSH_USER_DIR "/id_dsa"
+ #define _PATH_SSH_CLIENT_ID_ECDSA	_PATH_SSH_USER_DIR "/id_ecdsa"
+ #define _PATH_SSH_CLIENT_ID_RSA		_PATH_SSH_USER_DIR "/id_rsa"
+ #define _PATH_SSH_CLIENT_ID_ED25519	_PATH_SSH_USER_DIR "/id_ed25519"
+--- openssh-10.5p1.orig/readconf.c	2026-08-11 04:22:17.000000000 +0200
++++ openssh-10.5p1/readconf.c	2026-09-03 17:53:47.033890585 +0200
+@@ -2917,6 +2917,9 @@ fill_default_options(Options * options)
+ 	}
+ 	if (options->num_identity_files == 0) {
+ 		add_identity_file(options, "~/", _PATH_SSH_CLIENT_ID_RSA, 0);
++#ifdef WITH_DSA
++		add_identity_file(options, "~/", _PATH_SSH_CLIENT_ID_DSA, 0);
++#endif
+ 		add_identity_file(options, "~/", _PATH_SSH_CLIENT_ID_ECDSA, 0);
+ 		add_identity_file(options, "~/",
+ 		    _PATH_SSH_CLIENT_ID_ECDSA_SK, 0);
+--- openssh-10.5p1.orig/ssh-add.c	2026-08-11 04:22:17.000000000 +0200
++++ openssh-10.5p1/ssh-add.c	2026-09-03 17:53:47.034747034 +0200
+@@ -80,6 +80,9 @@ extern char *__progname;
+ static char *default_files[] = {
+ #ifdef WITH_OPENSSL
+ 	_PATH_SSH_CLIENT_ID_RSA,
++#ifdef WITH_DSA
++	_PATH_SSH_CLIENT_ID_DSA,
++#endif
+ 	_PATH_SSH_CLIENT_ID_ECDSA,
+ 	_PATH_SSH_CLIENT_ID_ECDSA_SK,
+ #endif /* WITH_OPENSSL */
+--- openssh-10.5p1.orig/ssh-keygen.c	2026-08-11 04:22:17.000000000 +0200
++++ openssh-10.5p1/ssh-keygen.c	2026-09-03 17:54:21.863142098 +0200
+@@ -70,14 +70,18 @@
+ #define DEFAULT_KEY_TYPE_NAME "ed25519"
+ 
+ /*
+- * Default number of bits in the RSA and ECDSA keys.  These value can be
++ * Default number of bits in the RSA, DSA and ECDSA keys.  These value can be
+  * overridden on the command line.
+  *
+- * These values provide security equivalent to at least 128 bits of security
+- * according to NIST Special Publication 800-57: Recommendation for Key
+- * Management Part 1 rev 4 section 5.6.1.
++ * These values, with the exception of DSA, provide security equivalent to at
++ * least 128 bits of security according to NIST Special Publication 800-57:
++ * Recommendation for Key Management Part 1 rev 4 section 5.6.1.
++ * For DSA it (and FIPS-186-4 section 4.2) specifies that the only size for
++ * which a 160bit hash is acceptable is 1kbit, and since ssh-dss specifies only
++ * SHA1 we limit the DSA key size 1k bits.
+  */
+ #define DEFAULT_BITS		3072
++#define DEFAULT_BITS_DSA	1024
+ #define DEFAULT_BITS_ECDSA	256
+ 
+ static int quiet = 0;
+@@ -181,6 +185,9 @@ type_bits_valid(int type, const char *na
+ 		int nid;
+ 
+ 		switch(type) {
++		case KEY_DSA:
++			*bitsp = DEFAULT_BITS_DSA;
++			break;
+ 		case KEY_ECDSA:
+ 			if (name != NULL &&
+ 			    (nid = sshkey_ecdsa_nid_from_name(name)) > 0)
+@@ -196,6 +203,10 @@ type_bits_valid(int type, const char *na
+ 	}
+ #ifdef WITH_OPENSSL
+ 	switch (type) {
++	case KEY_DSA:
++		if (*bitsp != 1024)
++			fatal("Invalid DSA key length: must be 1024 bits");
++		break;
+ 	case KEY_RSA:
+ 		if (*bitsp < SSH_RSA_MINIMUM_MODULUS_SIZE)
+ 			fatal("Invalid RSA key length: minimum is %d bits",
+@@ -246,6 +257,12 @@ ask_filename(struct passwd *pw, const ch
+ 		name = _PATH_SSH_CLIENT_ID_ED25519;
+ 	else {
+ 		switch (sshkey_type_from_shortname(key_type_name)) {
++#ifdef WITH_DSA
++		case KEY_DSA_CERT:
++		case KEY_DSA:
++			name = _PATH_SSH_CLIENT_ID_DSA;
++			break;
++#endif
+ 		case KEY_ECDSA_CERT:
+ 		case KEY_ECDSA:
+ 			name = _PATH_SSH_CLIENT_ID_ECDSA;
+@@ -357,6 +374,12 @@ do_convert_to_pkcs8(struct sshkey *k)
+ 		    EVP_PKEY_get0_RSA(k->pkey)))
+ 			fatal("PEM_write_RSA_PUBKEY failed");
+ 		break;
++#ifdef WITH_DSA
++	case KEY_DSA:
++		if (!PEM_write_DSA_PUBKEY(stdout, k->dsa))
++			fatal("PEM_write_DSA_PUBKEY failed");
++		break;
++#endif
+ 	case KEY_ECDSA:
+ 		if (!PEM_write_EC_PUBKEY(stdout,
+ 		    EVP_PKEY_get0_EC_KEY(k->pkey)))
+@@ -376,6 +399,12 @@ do_convert_to_pem(struct sshkey *k)
+ 		    EVP_PKEY_get0_RSA(k->pkey)))
+ 			fatal("PEM_write_RSAPublicKey failed");
+ 		break;
++#ifdef WITH_DSA
++	case KEY_DSA:
++		if (!PEM_write_DSA_PUBKEY(stdout, k->dsa))
++			fatal("PEM_write_DSA_PUBKEY failed");
++		break;
++#endif
+ 	case KEY_ECDSA:
+ 		if (!PEM_write_EC_PUBKEY(stdout,
+ 		    EVP_PKEY_get0_EC_KEY(k->pkey)))
+@@ -447,6 +476,10 @@ do_convert_private_ssh2(struct sshbuf *b
+ 	u_int magic, i1, i2, i3, i4;
+ 	size_t slen;
+ 	u_long e;
++#ifdef WITH_DSA
++	BIGNUM *dsa_p = NULL, *dsa_q = NULL, *dsa_g = NULL;
++	BIGNUM *dsa_pub_key = NULL, *dsa_priv_key = NULL;
++#endif
+ 	BIGNUM *rsa_n = NULL, *rsa_e = NULL, *rsa_d = NULL;
+ 	BIGNUM *rsa_p = NULL, *rsa_q = NULL, *rsa_iqmp = NULL;
+ 	BIGNUM *rsa_dmp1 = NULL, *rsa_dmq1 = NULL;
+@@ -478,6 +511,10 @@ do_convert_private_ssh2(struct sshbuf *b
+ 
+ 	if (strstr(type, "rsa")) {
+ 		ktype = KEY_RSA;
++#ifdef WITH_DSA
++	} else if (strstr(type, "dsa")) {
++		ktype = KEY_DSA;
++#endif
+ 	} else {
+ 		free(type);
+ 		return NULL;
+@@ -487,6 +524,27 @@ do_convert_private_ssh2(struct sshbuf *b
+ 	free(type);
+ 
+ 	switch (key->type) {
++#ifdef WITH_DSA
++	case KEY_DSA:
++		if ((dsa_p = BN_new()) == NULL ||
++		    (dsa_q = BN_new()) == NULL ||
++		    (dsa_g = BN_new()) == NULL ||
++		    (dsa_pub_key = BN_new()) == NULL ||
++		    (dsa_priv_key = BN_new()) == NULL)
++			fatal_f("BN_new");
++		buffer_get_bignum_bits(b, dsa_p);
++		buffer_get_bignum_bits(b, dsa_g);
++		buffer_get_bignum_bits(b, dsa_q);
++		buffer_get_bignum_bits(b, dsa_pub_key);
++		buffer_get_bignum_bits(b, dsa_priv_key);
++		if (!DSA_set0_pqg(key->dsa, dsa_p, dsa_q, dsa_g))
++			fatal_f("DSA_set0_pqg failed");
++		dsa_p = dsa_q = dsa_g = NULL; /* transferred */
++		if (!DSA_set0_key(key->dsa, dsa_pub_key, dsa_priv_key))
++			fatal_f("DSA_set0_key failed");
++		dsa_pub_key = dsa_priv_key = NULL; /* transferred */
++		break;
++#endif
+ 	case KEY_RSA:
+ 		if ((r = sshbuf_get_u8(b, &e1)) != 0 ||
+ 		    (e1 < 30 && (r = sshbuf_get_u8(b, &e2)) != 0) ||
+@@ -662,6 +720,14 @@ do_convert_from_pkcs8(struct sshkey **k,
+ 		(*k)->pkey = pubkey;
+ 		pubkey = NULL;
+ 		break;
++#ifdef WITH_DSA
++	case EVP_PKEY_DSA:
++		if ((*k = sshkey_new(KEY_UNSPEC)) == NULL)
++			fatal("sshkey_new failed");
++		(*k)->type = KEY_DSA;
++		(*k)->dsa = EVP_PKEY_get1_DSA(pubkey);
++		break;
++#endif
+ 	case EVP_PKEY_EC:
+ 		if ((*k = sshkey_new(KEY_UNSPEC)) == NULL)
+ 			fatal("sshkey_new failed");
+@@ -734,6 +800,12 @@ do_convert_from(struct passwd *pw)
+ 			fprintf(stdout, "\n");
+ 	} else {
+ 		switch (k->type) {
++#ifdef WITH_DSA
++		case KEY_DSA:
++			ok = PEM_write_DSAPrivateKey(stdout, k->dsa, NULL,
++			    NULL, 0, NULL, NULL);
++			break;
++#endif
+ 		case KEY_ECDSA:
+ 			ok = PEM_write_ECPrivateKey(stdout,
+ 			    EVP_PKEY_get0_EC_KEY(k->pkey), NULL, NULL, 0,
+@@ -3263,7 +3335,7 @@ usage(void)
+ 	fprintf(stderr,
+ 	    "usage: ssh-keygen [-q] [-a rounds] [-b bits] [-C comment] [-f output_keyfile]\n"
+ 	    "                  [-m format] [-N new_passphrase] [-O option]\n"
+-	    "                  [-t ecdsa|ecdsa-sk|ed25519|ed25519-sk|mldsa44-ed25519|rsa]\n"
++	    "                  [-t dsa|ecdsa|ecdsa-sk|ed25519|ed25519-sk|mldsa44-ed25519|rsa]\n"
+ 	    "                  [-w provider] [-Z cipher]\n"
+ 	    "       ssh-keygen -p [-a rounds] [-f keyfile] [-m format] [-N new_passphrase]\n"
+ 	    "                   [-P old_passphrase] [-Z cipher]\n"
+@@ -3759,6 +3831,11 @@ main(int argc, char **argv)
+ 			n += do_print_resource_record(pw,
+ 			    _PATH_HOST_RSA_KEY_FILE, rr_hostname,
+ 			    print_generic, opts, nopts);
++#ifdef WITH_DSA
++			n += do_print_resource_record(pw,
++			    _PATH_HOST_DSA_KEY_FILE, rr_hostname,
++			    print_generic, opts, nopts);
++#endif
+ 			n += do_print_resource_record(pw,
+ 			    _PATH_HOST_ECDSA_KEY_FILE, rr_hostname,
+ 			    print_generic, opts, nopts);
+--- openssh-10.5p1.orig/ssh-keyscan.c	2026-08-11 04:22:17.000000000 +0200
++++ openssh-10.5p1/ssh-keyscan.c	2026-09-03 17:53:47.035533145 +0200
+@@ -62,6 +62,7 @@ int ssh_port = SSH_DEFAULT_PORT;
+ #define KT_RSA		(1)
+ #define KT_ECDSA	(1<<1)
+ #define KT_ED25519	(1<<2)
++#define KT_DSA		(1<<3)
+ #define KT_ECDSA_SK	(1<<4)
+ #define KT_ED25519_SK	(1<<5)
+ #define KT_MLDSA44_ED25519 (1<<6)
+@@ -239,6 +240,10 @@ keygrab_ssh2(con *c)
+ 	int r;
+ 
+ 	switch (c->c_keytype) {
++	case KT_DSA:
++		myproposal[PROPOSAL_SERVER_HOST_KEY_ALGS] = get_cert ?
++		    "ssh-dss-cert-v01@openssh.com" : "ssh-dss";
++		break;
+ 	case KT_RSA:
+ 		myproposal[PROPOSAL_SERVER_HOST_KEY_ALGS] = get_cert ?
+ 		    "rsa-sha2-512-cert-v01@openssh.com,"
+@@ -747,6 +752,11 @@ main(int argc, char **argv)
+ 				int type = sshkey_type_from_shortname(tname);
+ 
+ 				switch (type) {
++#ifdef WITH_DSA
++				case KEY_DSA:
++					get_keytypes |= KT_DSA;
++					break;
++#endif
+ 				case KEY_ECDSA:
+ 					get_keytypes |= KT_ECDSA;
+ 					break;
+--- openssh-10.5p1.orig/ssh-keysign.c	2026-08-11 04:22:17.000000000 +0200
++++ openssh-10.5p1/ssh-keysign.c	2026-09-03 17:53:47.034832022 +0200
+@@ -200,6 +200,9 @@ main(int argc, char **argv)
+ 
+ 	i = 0;
+ 	/* XXX This really needs to read sshd_config for the paths */
++#ifdef WITH_DSA
++	key_fd[i++] = open(_PATH_HOST_DSA_KEY_FILE, O_RDONLY);
++#endif
+ 	key_fd[i++] = open(_PATH_HOST_ECDSA_KEY_FILE, O_RDONLY);
+ 	key_fd[i++] = open(_PATH_HOST_ED25519_KEY_FILE, O_RDONLY);
+ 	key_fd[i++] = open(_PATH_HOST_RSA_KEY_FILE, O_RDONLY);
+--- openssh-10.5p1.orig/ssh.c	2026-08-11 04:22:17.000000000 +0200
++++ openssh-10.5p1/ssh.c	2026-09-03 17:53:47.034561240 +0200
+@@ -1758,10 +1758,16 @@ main(int ac, char **av)
+ 			L_CERT(_PATH_HOST_ED25519_KEY_FILE, 1);
+ 			L_CERT(_PATH_HOST_RSA_KEY_FILE, 2);
+ 			L_CERT(_PATH_HOST_MLDSA44_ED25519_KEY_FILE, 3);
++#ifdef WITH_DSA
++			L_CERT(_PATH_HOST_DSA_KEY_FILE, 8);
++#endif
+ 			L_PUBKEY(_PATH_HOST_ECDSA_KEY_FILE, 4);
+ 			L_PUBKEY(_PATH_HOST_ED25519_KEY_FILE, 5);
+ 			L_PUBKEY(_PATH_HOST_RSA_KEY_FILE, 6);
+ 			L_PUBKEY(_PATH_HOST_MLDSA44_ED25519_KEY_FILE, 7);
++#ifdef WITH_DSA
++			L_PUBKEY(_PATH_HOST_DSA_KEY_FILE, 9);
++#endif
+ 			if (loaded == 0)
+ 				debug("HostbasedAuthentication enabled but no "
+ 				   "local public host keys could be loaded.");
+--- openssh-10.5p1.orig/ssh_config	2026-08-11 04:22:17.000000000 +0200
++++ openssh-10.5p1/ssh_config	2026-09-03 17:25:34.370082823 +0200
+@@ -1,4 +1,4 @@
+-#	$OpenBSD: ssh_config,v 1.37 2025/05/06 05:40:56 djm Exp $
++#	$OpenBSD: ssh_config,v 1.36 2023/08/02 23:04:38 djm Exp $
+ 
+ # This is the ssh client system-wide configuration file.  See
+ # ssh_config(5) for more information.  This file provides defaults for
+@@ -30,6 +30,7 @@
+ #   ConnectTimeout 0
+ #   StrictHostKeyChecking ask
+ #   IdentityFile ~/.ssh/id_rsa
++#   IdentityFile ~/.ssh/id_dsa
+ #   IdentityFile ~/.ssh/id_ecdsa
+ #   IdentityFile ~/.ssh/id_ed25519
+ #   Port 22
+--- openssh-10.5p1.orig/sshconnect.c	2026-08-11 04:22:17.000000000 +0200
++++ openssh-10.5p1/sshconnect.c	2026-09-03 17:53:47.034994959 +0200
+@@ -1674,6 +1674,9 @@ show_other_keys(struct hostkeys *hostkey
+ {
+ 	int type[] = {
+ 		KEY_RSA,
++#ifdef WITH_DSA
++		KEY_DSA,
++#endif
+ 		KEY_ECDSA,
+ 		KEY_ED25519,
+ 		KEY_MLDSA44_ED25519,
+--- openssh-10.5p1.orig/sshd-auth.c	2026-08-11 04:22:17.000000000 +0200
++++ openssh-10.5p1/sshd-auth.c	2026-09-03 17:53:47.035448431 +0200
+@@ -247,6 +247,9 @@ list_hostkey_types(void)
+ 			append_hostkey_type(b, "rsa-sha2-512");
+ 			append_hostkey_type(b, "rsa-sha2-256");
+ 			/* FALLTHROUGH */
++#ifdef WITH_DSA
++		case KEY_DSA:
++#endif
+ 		case KEY_ECDSA:
+ 		case KEY_ED25519:
+ 		case KEY_MLDSA44_ED25519:
+@@ -267,6 +270,9 @@ list_hostkey_types(void)
+ 			append_hostkey_type(b,
+ 			    "rsa-sha2-256-cert-v01@openssh.com");
+ 			/* FALLTHROUGH */
++#ifdef WITH_DSA
++		case KEY_DSA_CERT:
++#endif
+ 		case KEY_ECDSA_CERT:
+ 		case KEY_ED25519_CERT:
+ 		case KEY_MLDSA44_ED25519_CERT:
+@@ -292,6 +298,9 @@ get_hostkey_public_by_type(int type, int
+ 	for (i = 0; i < options.num_host_key_files; i++) {
+ 		switch (type) {
+ 		case KEY_RSA_CERT:
++#ifdef WITH_DSA
++		case KEY_DSA_CERT:
++#endif
+ 		case KEY_ECDSA_CERT:
+ 		case KEY_ED25519_CERT:
+ 		case KEY_MLDSA44_ED25519_CERT:
+--- openssh-10.5p1.orig/sshd-session.c	2026-08-11 04:22:17.000000000 +0200
++++ openssh-10.5p1/sshd-session.c	2026-09-03 17:25:34.370701274 +0200
+@@ -435,6 +435,7 @@ get_hostkey_by_type(int type, int nid, i
+ 	for (i = 0; i < options.num_host_key_files; i++) {
+ 		switch (type) {
+ 		case KEY_RSA_CERT:
++		case KEY_DSA_CERT:
+ 		case KEY_ECDSA_CERT:
+ 		case KEY_ED25519_CERT:
+ 		case KEY_ECDSA_SK_CERT:
+--- openssh-10.5p1.orig/sshd.c	2026-08-11 04:22:17.000000000 +0200
++++ openssh-10.5p1/sshd.c	2026-09-03 17:53:47.035137474 +0200
+@@ -1652,6 +1652,9 @@ main(int ac, char **av)
+ 
+ 		switch (keytype) {
+ 		case KEY_RSA:
++#ifdef WITH_DSA
++		case KEY_DSA:
++#endif
+ 		case KEY_ECDSA:
+ 		case KEY_ED25519:
+ 		case KEY_MLDSA44_ED25519:
+--- openssh-10.5p1.orig/sshkey.c	2026-08-11 04:22:17.000000000 +0200
++++ openssh-10.5p1/sshkey.c	2026-09-03 17:52:58.999985011 +0200
+@@ -113,6 +113,10 @@ extern const struct sshkey_impl sshkey_r
+ extern const struct sshkey_impl sshkey_rsa_sha256_cert_impl;
+ extern const struct sshkey_impl sshkey_rsa_sha512_impl;
+ extern const struct sshkey_impl sshkey_rsa_sha512_cert_impl;
++# ifdef WITH_DSA
++extern const struct sshkey_impl sshkey_dss_impl;
++extern const struct sshkey_impl sshkey_dsa_cert_impl;
++# endif
+ #endif /* WITH_OPENSSL */
+ 
+ const struct sshkey_impl * const keyimpls[] = {
+@@ -139,6 +143,10 @@ const struct sshkey_impl * const keyimpl
+ 	&sshkey_ecdsa_sk_webauthn_impl,
+ 	&sshkey_ecdsa_sk_webauthn_cert_impl,
+ # endif /* ENABLE_SK */
++# ifdef WITH_DSA
++	&sshkey_dss_impl,
++	&sshkey_dsa_cert_impl,
++# endif
+ 	&sshkey_rsa_impl,
+ 	&sshkey_rsa_cert_impl,
+ 	&sshkey_rsa_sha256_impl,
+@@ -433,6 +441,8 @@ sshkey_type_plain(int type)
+ 	switch (type) {
+ 	case KEY_RSA_CERT:
+ 		return KEY_RSA;
++	case KEY_DSA_CERT:
++		return KEY_DSA;
+ 	case KEY_ECDSA_CERT:
+ 		return KEY_ECDSA;
+ 	case KEY_ECDSA_SK_CERT:
+@@ -455,6 +465,8 @@ sshkey_type_certified(int type)
+ 	switch (type) {
+ 	case KEY_RSA:
+ 		return KEY_RSA_CERT;
++	case KEY_DSA:
++		return KEY_DSA_CERT;
+ 	case KEY_ECDSA:
+ 		return KEY_ECDSA_CERT;
+ 	case KEY_ECDSA_SK:
+@@ -3297,6 +3309,20 @@ sshkey_private_to_blob_pem_pkcs8(struct
+ 		goto out;
+ 
+ 	switch (key->type) {
++#ifdef WITH_DSA
++	case KEY_DSA:
++		if (format == SSHKEY_PRIVATE_PEM) {
++			success = PEM_write_bio_DSAPrivateKey(bio, key->dsa,
++			    cipher, passphrase, len, NULL, NULL);
++		} else {
++			if ((pkey = EVP_PKEY_new()) == NULL) {
++				r = SSH_ERR_ALLOC_FAIL;
++				goto out;
++			}
++			success = EVP_PKEY_set1_DSA(pkey, key->dsa);
++		}
++		break;
++#endif
+ 	case KEY_ECDSA:
+ 		if (format == SSHKEY_PRIVATE_PEM) {
+ 			success = PEM_write_bio_ECPrivateKey(bio,
+@@ -3375,6 +3401,9 @@ sshkey_private_to_fileblob(struct sshkey
+ {
+ 	switch (key->type) {
+ #ifdef WITH_OPENSSL
++#ifdef WITH_DSA
++	case KEY_DSA:
++#endif
+ 	case KEY_ECDSA:
+ 	case KEY_RSA:
+ 	case KEY_ED25519:
+@@ -3552,6 +3581,19 @@ sshkey_parse_private_pem_fileblob(struct
+ 		prv->pkey = pk;
+ 		if ((r = sshkey_check_rsa_length(prv, 0)) != 0)
+ 			goto out;
++#ifdef WITH_DSA
++	} else if (EVP_PKEY_base_id(pk) == EVP_PKEY_DSA &&
++	    (type == KEY_UNSPEC || type == KEY_DSA)) {
++		if ((prv = sshkey_new(KEY_UNSPEC)) == NULL) {
++			r = SSH_ERR_ALLOC_FAIL;
++			goto out;
++		}
++		prv->dsa = EVP_PKEY_get1_DSA(pk);
++		prv->type = KEY_DSA;
++#ifdef DEBUG_PK
++		DSA_print_fp(stderr, prv->dsa, 8);
++#endif
++#endif
+ 	} else if (EVP_PKEY_base_id(pk) == EVP_PKEY_EC &&
+ 	    (type == KEY_UNSPEC || type == KEY_ECDSA)) {
+ 		if ((prv = sshkey_new(KEY_UNSPEC)) == NULL) {
+--- openssh-10.5p1.orig/sshkey.h	2026-08-11 04:22:17.000000000 +0200
++++ openssh-10.5p1/sshkey.h	2026-09-03 17:52:29.113495487 +0200
+@@ -30,6 +30,9 @@
+ 
+ #ifdef WITH_OPENSSL
+ #include <openssl/rsa.h>
++#ifdef WITH_DSA
++#include <openssl/dsa.h>
++#endif
+ #include <openssl/ec.h>
+ #include <openssl/ecdsa.h>
+ #include <openssl/evp.h>
+@@ -37,6 +40,7 @@
+ #else /* OPENSSL */
+ #define BIGNUM		void
+ #define RSA		void
++#define DSA		void
+ #define EC_KEY		void
+ #define EC_GROUP	void
+ #define EC_POINT	void
+@@ -52,9 +56,11 @@ struct sshbuf;
+ /* Key types */
+ enum sshkey_types {
+ 	KEY_RSA,
++	KEY_DSA,
+ 	KEY_ECDSA,
+ 	KEY_ED25519,
+ 	KEY_RSA_CERT,
++	KEY_DSA_CERT,
+ 	KEY_ECDSA_CERT,
+ 	KEY_ED25519_CERT,
+ 	KEY_ECDSA_SK,
+@@ -113,6 +119,8 @@ struct sshkey_cert {
+ struct sshkey {
+ 	int	 type;
+ 	int	 flags;
++	/* KEY_DSA */
++	DSA	*dsa;
+ 	/* KEY_ECDSA and KEY_ECDSA_SK */
+ 	int	 ecdsa_nid;	/* NID of curve */
+ 	/* libcrypto-backed keys */
+@@ -330,6 +338,7 @@ int	check_rsa_length(const RSA *rsa); /*
+ 
+ #ifndef WITH_OPENSSL
+ #undef RSA
++#undef DSA
+ #undef EC_KEY
+ #undef EC_GROUP
+ #undef EC_POINT

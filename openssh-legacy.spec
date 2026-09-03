@@ -20,37 +20,30 @@ Summary(pt_BR.UTF-8):	Implementação livre do SSH
 Summary(ru.UTF-8):	OpenSSH - свободная реализация протокола Secure Shell (SSH)
 Summary(uk.UTF-8):	OpenSSH - вільна реалізація протоколу Secure Shell (SSH)
 Name:		openssh-legacy
-# Upgrade only to versions that support DSA keys
-Version:	9.8p1
-Release:	13
+Version:	10.5p1
+Release:	1
 License:	BSD
 Group:		Applications/Networking
 Source0:	https://ftp.openbsd.org/pub/OpenBSD/OpenSSH/portable/openssh-%{version}.tar.gz
-# Source0-md5:	bc04ff77796758c0b37bd0bc9314cd3f
+# Source0-md5:	a95119f402dfa0166c9dd1237239085c
 Patch0:		openssh-no-pty-tests.patch
 Patch1:		openssh-tests-reuseport.patch
 Patch2:		openssh-pam_misc.patch
-Patch3:		openssh-sigpipe.patch
-# http://pkgs.fedoraproject.org/gitweb/?p=openssh.git;a=tree
-Patch4:		openssh-ldap.patch
-Patch5:		openssh-ldap-fixes.patch
-Patch6:		ldap.conf.patch
 Patch7:		openssh-config.patch
-Patch8:		ldap-helper-sigpipe.patch
-
-Patch11:	openssh-chroot.patch
 
 Patch13:	openssh-skip-interop-tests.patch
 Patch14:	openssh-bind.patch
+# the whole point of this package: upstream dropped DSA in 10.0
+Patch100:	openssh-dsa.patch
 URL:		http://www.openssh.com/portable.html
 BuildRequires:	%{__perl}
 BuildRequires:	autoconf >= 2.50
 BuildRequires:	automake
+%{?with_kerberos5:BuildRequires:	heimdal-devel >= 0.7}
 %{?with_libedit:BuildRequires:	libedit-devel}
 BuildRequires:	libfido2-devel >= 1.5.0
 %{?with_libseccomp:BuildRequires:	libseccomp-devel}
 %{?with_selinux:BuildRequires:	libselinux-devel}
-%{?with_ldap:BuildRequires:	openldap-devel}
 BuildRequires:	openssl-devel >= 1.1.1
 BuildRequires:	pam-devel
 %if %{with tests} && %{with tests_conch}
@@ -254,18 +247,12 @@ Ssh (Secure Shell) - це програма для "заходу" (login) до в
 %patch -P0 -p1
 %patch -P1 -p1
 %patch -P2 -p1
-%patch -P3 -p1
-%patch -P4 -p1
-%patch -P5 -p1
-%patch -P6 -p1
 %patch -P7 -p1
-%patch -P8 -p1
-
-%patch -P11 -p1
 
 %patch -P13 -p1
 
 %patch -P14 -p1
+%patch -P100 -p1
 
 # hack since arc4random from openbsd-compat needs symbols from libssh and vice versa
 sed -i -e 's#-lssh -lopenbsd-compat#-lssh -lopenbsd-compat -lssh -lopenbsd-compat#g' Makefile*
@@ -277,7 +264,7 @@ sed -i -e 's#-lssh -lopenbsd-compat#-lssh -lopenbsd-compat -lssh -lopenbsd-compa
 %{__aclocal}
 %{__autoconf}
 %{__autoheader}
-CPPFLAGS="%{rpmcppflags} -DCHROOT -std=gnu99"
+CPPFLAGS="%{rpmcppflags} -std=gnu99"
 %configure \
 	PERL=%{__perl} \
 	--disable-strip \
@@ -305,7 +292,10 @@ CPPFLAGS="%{rpmcppflags} -DCHROOT -std=gnu99"
 %endif
 	--with-xauth=%{_bindir}/xauth
 
-%{__make} ssh scp sftp ssh-keygen ssh-keyscan ssh-keysign
+# scp/sftp exec ssh as their transport; the system one has no DSA,
+# which is the only reason this package exists
+%{__make} ssh scp sftp ssh-keygen ssh-keyscan ssh-keysign \
+	SSH_PROGRAM=%{_bindir}/ssh-legacy
 
 %if %{with tests}
 %{__make} -j1 tests \
